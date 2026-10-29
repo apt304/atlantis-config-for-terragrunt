@@ -1,0 +1,89 @@
+---
+# Example values file for the Atlantis Helm chart.
+# https://github.com/runatlantis/helm-charts/blob/main/charts/atlantis/values.yaml
+#
+# The initConfig init container installs terragrunt, uv, and the config
+# script into the shared directory (/plugins by default). The chart adds
+# that directory to the PATH of the Atlantis pod.
+#
+# The pre_workflow_hooks step regenerates the Terragrunt stacks and the
+# atlantis.yaml config on every pull request.
+
+initConfig:
+  enabled: true
+  script: |
+    #!/bin/sh
+    set -eux
+
+    # terragrunt
+    TG_VERSION="1.2.1"
+    TG_SHA256SUM="f2f6238ad2348855a4e876b90fd31f3f5d106bb234794202a00b2bcc139fa753"
+    TG_FILE="$INIT_SHARED_DIR/terragrunt"
+    wget "https://github.com/gruntwork-io/terragrunt/releases/download/v$TG_VERSION/terragrunt_linux_amd64" -O "$TG_FILE"
+    echo "$TG_SHA256SUM  $TG_FILE" | sha256sum -c
+    chmod 755 "$TG_FILE"
+    "$TG_FILE" -v
+
+    # uv
+    UV_VERSION="0.13.6"
+    UV_SHA256SUM="5d61f26b6c7213779eda90edc6971ea6b0b796bfb8d49a574c8ad69b59838548"
+    UV_TARBALL="uv-x86_64-unknown-linux-musl.tar.gz"
+    wget "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$UV_TARBALL" -O /tmp/$UV_TARBALL
+    echo "$UV_SHA256SUM  /tmp/$UV_TARBALL" | sha256sum -c
+    tar xf /tmp/$UV_TARBALL -C /tmp
+    install /tmp/uv-*/uv "$INIT_SHARED_DIR"
+    install /tmp/uv-*/uvx "$INIT_SHARED_DIR"
+    "$INIT_SHARED_DIR/uv" --version
+
+    # config script
+    wget \
+      "https://raw.githubusercontent.com/apt304/atlantis-config-for-terragrunt/main/atlantis-config-for-terragrunt.py" \
+       -O "/tmp/atlantis-config-for-terragrunt.py"
+
+    install atlantis-config-for-terragrunt.py "$INIT_SHARED_DIR"
+
+repoConfig: |
+  repos:
+  - id: /.*/
+    apply_requirements:
+      - approved
+    workflow: terragrunt
+    pre_workflow_hooks:
+      - run: |
+          set -eux
+          find -iname "terragrunt.stack.hcl" \
+          | grep -v templates \
+          | grep -v "terragrunt-stacks/" \
+          | grep -v "terragrunt-units/" \
+          | xargs -n1 dirname \
+          | xargs -n1 terragrunt stack generate --working-dir
+          terragrunt find --json --dependencies --include --reading | /plugins/atlantis-config-for-terragrunt.py > atlantis.yaml
+
+  workflows:
+    terragrunt:
+      plan:
+        steps:
+        - env:
+            name: TG_LOG_LEVEL
+            value: error
+        - env:
+            name: TG_SOURCE_UPDATE
+            value: true
+        - run: rm -rf /tmp/$BASE_REPO_OWNER-$BASE_REPO_NAME-$PULL_NUM-*.*
+        - run: terragrunt hcl format --check
+        - run:
+            command: terragrunt plan -no-color -out=$PLANFILE
+            output: strip_refreshing
+        - run: terragrunt show -no-color -json $PLANFILE > $SHOWFILE
+      apply:
+        steps:
+        - env:
+            name: TG_LOG_LEVEL
+            value: error
+        - env:
+            name: TG_SOURCE_UPDATE
+            value: true
+        - run: terragrunt hcl format --check
+        - run:
+            command: terragrunt apply -no-color $PLANFILE
+            output: strip_refreshing
